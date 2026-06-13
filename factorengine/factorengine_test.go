@@ -2,6 +2,7 @@ package factorengine
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -1084,6 +1085,68 @@ func TestBytecodeUsesPools(t *testing.T) {
 	}
 	if !foundConst || !foundLoad || !foundBuiltin {
 		t.Fatalf("expected pooled instructions, got const=%v load=%v builtin=%v", foundConst, foundLoad, foundBuiltin)
+	}
+}
+
+func TestBytecodeDisassemble(t *testing.T) {
+	registry := FactorRegistry{
+		"f_amount": {
+			FactorCode: "f_amount",
+			OutputSchema: Schema{
+				"value": {Type: ValueTypeLong, Required: true},
+			},
+		},
+	}
+
+	compiled, err := NewRuleCompiler().Compile("contains([1, 2], f_amount)", registry)
+	if err != nil {
+		t.Fatalf("Compile returned error: %v", err)
+	}
+
+	disasm := compiled.Bytecode().Disassemble()
+	if disasm == "" {
+		t.Fatal("expected non-empty disassembly")
+	}
+	if !strings.Contains(disasm, "PUSH_CONST") {
+		t.Fatalf("expected PUSH_CONST in disassembly, got:\n%s", disasm)
+	}
+	if !strings.Contains(disasm, "LOAD_FACTOR") {
+		t.Fatalf("expected LOAD_FACTOR in disassembly, got:\n%s", disasm)
+	}
+	if !strings.Contains(disasm, "CALL_BUILTIN") {
+		t.Fatalf("expected CALL_BUILTIN in disassembly, got:\n%s", disasm)
+	}
+}
+
+func TestBytecodeVMTrace(t *testing.T) {
+	registry := FactorRegistry{
+		"f_amount": {
+			FactorCode: "f_amount",
+			OutputSchema: Schema{
+				"value": {Type: ValueTypeLong, Required: true},
+			},
+		},
+	}
+
+	compiled, err := NewRuleCompiler().Compile("f_amount > 100", registry)
+	if err != nil {
+		t.Fatalf("Compile returned error: %v", err)
+	}
+
+	trace, result, err := NewBytecodeVM().Trace(compiled.Bytecode(), EvalContext{
+		"f_amount": int64(200),
+	})
+	if err != nil {
+		t.Fatalf("Trace returned error: %v", err)
+	}
+	if result != true {
+		t.Fatalf("unexpected trace result: %v", result)
+	}
+	if len(trace) == 0 {
+		t.Fatal("expected non-empty trace")
+	}
+	if trace[0].Instruction == "" {
+		t.Fatal("expected instruction text in trace")
 	}
 }
 

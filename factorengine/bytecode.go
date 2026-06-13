@@ -1,6 +1,9 @@
 package factorengine
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 type OpCode byte
 
@@ -41,6 +44,13 @@ type BytecodeProgram struct {
 	ResultType   ValueType
 }
 
+type TraceStep struct {
+	IP          int
+	Instruction string
+	StackBefore []any
+	StackAfter  []any
+}
+
 type BytecodeCompiler struct {
 	constIndex    map[string]int
 	accessorIndex map[string]int
@@ -55,6 +65,70 @@ func NewBytecodeCompiler() *BytecodeCompiler {
 		constIndex:    make(map[string]int),
 		accessorIndex: make(map[string]int),
 		builtinIndex:  make(map[string]int),
+	}
+}
+
+func (p BytecodeProgram) Disassemble() string {
+	var lines []string
+	for ip, inst := range p.Instructions {
+		lines = append(lines, fmt.Sprintf("%03d  %s", ip, p.formatInstruction(inst)))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (p BytecodeProgram) formatInstruction(inst Instruction) string {
+	switch inst.Op {
+	case OpPushConst:
+		if inst.Arg >= 0 && inst.Arg < len(p.Constants) {
+			return fmt.Sprintf("PUSH_CONST   c[%d]=%#v", inst.Arg, p.Constants[inst.Arg])
+		}
+		return fmt.Sprintf("PUSH_CONST   c[%d]", inst.Arg)
+	case OpLoadFactor:
+		if inst.Arg >= 0 && inst.Arg < len(p.Accessors) {
+			return fmt.Sprintf("LOAD_FACTOR  a[%d]=%#v", inst.Arg, p.Accessors[inst.Arg])
+		}
+		return fmt.Sprintf("LOAD_FACTOR  a[%d]", inst.Arg)
+	case OpMakeList:
+		return fmt.Sprintf("MAKE_LIST    n=%d", inst.Arg)
+	case OpMakeMap:
+		return fmt.Sprintf("MAKE_MAP     n=%d", inst.Arg)
+	case OpUnaryNot:
+		return "UNARY_NOT"
+	case OpUnaryNeg:
+		return "UNARY_NEG"
+	case OpBinaryLT:
+		return "BINARY_LT"
+	case OpBinaryLE:
+		return "BINARY_LE"
+	case OpBinaryGT:
+		return "BINARY_GT"
+	case OpBinaryGE:
+		return "BINARY_GE"
+	case OpBinaryEQ:
+		return "BINARY_EQ"
+	case OpBinaryNE:
+		return "BINARY_NE"
+	case OpBinaryAdd:
+		return "BINARY_ADD"
+	case OpBinarySub:
+		return "BINARY_SUB"
+	case OpBinaryMul:
+		return "BINARY_MUL"
+	case OpBinaryDiv:
+		return "BINARY_DIV"
+	case OpJumpIfFalse:
+		return fmt.Sprintf("JUMP_IF_FALSE -> %d", inst.Arg)
+	case OpJumpIfTrue:
+		return fmt.Sprintf("JUMP_IF_TRUE  -> %d", inst.Arg)
+	case OpJump:
+		return fmt.Sprintf("JUMP          -> %d", inst.Arg)
+	case OpCallBuiltin:
+		if inst.Arg >= 0 && inst.Arg < len(p.Builtins) {
+			return fmt.Sprintf("CALL_BUILTIN  b[%d]=%s argc=%d", inst.Arg, p.Builtins[inst.Arg], inst.Aux)
+		}
+		return fmt.Sprintf("CALL_BUILTIN  b[%d] argc=%d", inst.Arg, inst.Aux)
+	default:
+		return fmt.Sprintf("UNKNOWN_OP(%d)", inst.Op)
 	}
 }
 
@@ -246,19 +320,34 @@ func NewBytecodeVM() *BytecodeVM {
 }
 
 func (vm *BytecodeVM) Eval(program BytecodeProgram, ctx EvalContext) (any, error) {
+	result, _, err := vm.eval(program, ctx, false)
+	return result, err
+}
+
+func (vm *BytecodeVM) Trace(program BytecodeProgram, ctx EvalContext) ([]TraceStep, any, error) {
+	result, steps, err := vm.eval(program, ctx, true)
+	return steps, result, err
+}
+
+func (vm *BytecodeVM) eval(program BytecodeProgram, ctx EvalContext, trace bool) (any, []TraceStep, error) {
 	stack := make([]any, 0, 16)
+	var steps []TraceStep
 	ip := 0
 	for ip < len(program.Instructions) {
 		inst := program.Instructions[ip]
+		var before []any
+		if trace {
+			before = append([]any(nil), stack...)
+		}
 		switch inst.Op {
 		case OpPushConst:
 			if inst.Arg < 0 || inst.Arg >= len(program.Constants) {
-				return nil, ValidationError{Code: ErrExpressionInvalid, Message: "invalid constant index"}
+				return nil, steps, ValidationError{Code: ErrExpressionInvalid, Message: "invalid constant index"}
 			}
 			stack = append(stack, program.Constants[inst.Arg])
 		case OpLoadFactor:
 			if inst.Arg < 0 || inst.Arg >= len(program.Accessors) {
-				return nil, ValidationError{Code: ErrExpressionInvalid, Message: "invalid accessor index"}
+				return nil, steps, ValidationError{Code: ErrExpressionInvalid, Message: "invalid accessor index"}
 			}
 			value, ok := program.Accessors[inst.Arg].Get(ctx)
 			if !ok {
@@ -268,7 +357,7 @@ func (vm *BytecodeVM) Eval(program BytecodeProgram, ctx EvalContext) (any, error
 			}
 		case OpMakeList:
 			if len(stack) < inst.Arg {
-				return nil, ValidationError{Code: ErrExpressionInvalid, Message: "stack underflow in MAKE_LIST"}
+				return nil, steps, ValidationError{Code: ErrExpressionInvalid, Message: "stack underflow in MAKE_LIST"}
 			}
 			start := len(stack) - inst.Arg
 			values := append([]any(nil), stack[start:]...)
@@ -277,14 +366,14 @@ func (vm *BytecodeVM) Eval(program BytecodeProgram, ctx EvalContext) (any, error
 		case OpMakeMap:
 			need := inst.Arg * 2
 			if len(stack) < need {
-				return nil, ValidationError{Code: ErrExpressionInvalid, Message: "stack underflow in MAKE_MAP"}
+				return nil, steps, ValidationError{Code: ErrExpressionInvalid, Message: "stack underflow in MAKE_MAP"}
 			}
 			start := len(stack) - need
 			values := make(map[string]any, inst.Arg)
 			for i := start; i < len(stack); i += 2 {
 				key, ok := stack[i].(string)
 				if !ok {
-					return nil, ValidationError{Code: ErrTypeMismatch, Message: "map key must be STRING"}
+					return nil, steps, ValidationError{Code: ErrTypeMismatch, Message: "map key must be STRING"}
 				}
 				values[key] = stack[i+1]
 			}
@@ -293,7 +382,7 @@ func (vm *BytecodeVM) Eval(program BytecodeProgram, ctx EvalContext) (any, error
 		case OpUnaryNot, OpUnaryNeg:
 			value, err := vm.pop(&stack)
 			if err != nil {
-				return nil, err
+				return nil, steps, err
 			}
 			var result any
 			switch inst.Op {
@@ -303,68 +392,100 @@ func (vm *BytecodeVM) Eval(program BytecodeProgram, ctx EvalContext) (any, error
 				result, err = evalNegate(value)
 			}
 			if err != nil {
-				return nil, err
+				return nil, steps, err
 			}
 			stack = append(stack, result)
 		case OpBinaryLT, OpBinaryLE, OpBinaryGT, OpBinaryGE, OpBinaryEQ, OpBinaryNE, OpBinaryAdd, OpBinarySub, OpBinaryMul, OpBinaryDiv:
 			right, err := vm.pop(&stack)
 			if err != nil {
-				return nil, err
+				return nil, steps, err
 			}
 			left, err := vm.pop(&stack)
 			if err != nil {
-				return nil, err
+				return nil, steps, err
 			}
 			result, err := evalBinaryValues(inst.Op, left, right)
 			if err != nil {
-				return nil, err
+				return nil, steps, err
 			}
 			stack = append(stack, result)
 		case OpJumpIfFalse:
 			value, err := vm.pop(&stack)
 			if err != nil {
-				return nil, err
+				return nil, steps, err
 			}
 			if !truthyBool(value) {
+				if trace {
+					steps = append(steps, TraceStep{
+						IP:          ip,
+						Instruction: program.formatInstruction(inst),
+						StackBefore: before,
+						StackAfter:  append([]any(nil), stack...),
+					})
+				}
 				ip = inst.Arg
 				continue
 			}
 		case OpJumpIfTrue:
 			value, err := vm.pop(&stack)
 			if err != nil {
-				return nil, err
+				return nil, steps, err
 			}
 			if truthyBool(value) {
+				if trace {
+					steps = append(steps, TraceStep{
+						IP:          ip,
+						Instruction: program.formatInstruction(inst),
+						StackBefore: before,
+						StackAfter:  append([]any(nil), stack...),
+					})
+				}
 				ip = inst.Arg
 				continue
 			}
 		case OpJump:
+			if trace {
+				steps = append(steps, TraceStep{
+					IP:          ip,
+					Instruction: program.formatInstruction(inst),
+					StackBefore: before,
+					StackAfter:  append([]any(nil), stack...),
+				})
+			}
 			ip = inst.Arg
 			continue
 		case OpCallBuiltin:
 			if inst.Arg < 0 || inst.Arg >= len(program.Builtins) {
-				return nil, ValidationError{Code: ErrExpressionInvalid, Message: "invalid builtin index"}
+				return nil, steps, ValidationError{Code: ErrExpressionInvalid, Message: "invalid builtin index"}
 			}
 			if len(stack) < inst.Aux {
-				return nil, ValidationError{Code: ErrExpressionInvalid, Message: "stack underflow in CALL_BUILTIN"}
+				return nil, steps, ValidationError{Code: ErrExpressionInvalid, Message: "stack underflow in CALL_BUILTIN"}
 			}
 			start := len(stack) - inst.Aux
 			args := append([]any(nil), stack[start:]...)
 			stack = stack[:start]
 			result, err := evalBuiltinValues(program.Builtins[inst.Arg], args)
 			if err != nil {
-				return nil, err
+				return nil, steps, err
 			}
 			stack = append(stack, result)
 		default:
-			return nil, ValidationError{Code: ErrExpressionInvalid, Message: fmt.Sprintf("unsupported opcode %q", inst.Op)}
+			return nil, steps, ValidationError{Code: ErrExpressionInvalid, Message: fmt.Sprintf("unsupported opcode %d", inst.Op)}
+		}
+		if trace {
+			steps = append(steps, TraceStep{
+				IP:          ip,
+				Instruction: program.formatInstruction(inst),
+				StackBefore: before,
+				StackAfter:  append([]any(nil), stack...),
+			})
 		}
 		ip++
 	}
 	if len(stack) != 1 {
-		return nil, ValidationError{Code: ErrExpressionInvalid, Message: "vm finished with invalid stack state"}
+		return nil, steps, ValidationError{Code: ErrExpressionInvalid, Message: "vm finished with invalid stack state"}
 	}
-	return stack[0], nil
+	return stack[0], steps, nil
 }
 
 func (vm *BytecodeVM) pop(stack *[]any) (any, error) {
