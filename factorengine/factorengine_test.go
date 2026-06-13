@@ -524,8 +524,37 @@ func TestCachedRuleCompilerHitsCache(t *testing.T) {
 		t.Fatalf("expected cached compiled expr fingerprint to match, got %q and %q", first.Fingerprint(), second.Fingerprint())
 	}
 	stats := cache.Stats()
-	if stats.Entries != 1 || stats.Gets != 2 || stats.Hits != 1 || stats.Misses != 1 || stats.Sets != 1 {
+	if stats.Entries != 1 || stats.Capacity != 0 || stats.Gets != 2 || stats.Hits != 1 || stats.Misses != 1 || stats.Sets != 1 || stats.Evictions != 0 {
 		t.Fatalf("unexpected cache stats: %+v", stats)
+	}
+}
+
+func TestLRUProgramCacheEvictsLeastRecentlyUsed(t *testing.T) {
+	cache := NewLRUProgramCache(2)
+	a := compiledExpr{source: "a", bytecode: BytecodeProgram{Instructions: []Instruction{{Op: OpPushConst, Arg: 0}}, Constants: []any{1}, ResultType: ValueTypeLong}, resultType: ValueTypeLong}
+	b := compiledExpr{source: "b", bytecode: BytecodeProgram{Instructions: []Instruction{{Op: OpPushConst, Arg: 0}}, Constants: []any{2}, ResultType: ValueTypeLong}, resultType: ValueTypeLong}
+	c := compiledExpr{source: "c", bytecode: BytecodeProgram{Instructions: []Instruction{{Op: OpPushConst, Arg: 0}}, Constants: []any{3}, ResultType: ValueTypeLong}, resultType: ValueTypeLong}
+
+	cache.Set("a", a)
+	cache.Set("b", b)
+	if _, ok := cache.Get("a"); !ok {
+		t.Fatal("expected key a to exist before eviction")
+	}
+	cache.Set("c", c)
+
+	if _, ok := cache.Get("a"); !ok {
+		t.Fatal("expected key a to remain after recent access")
+	}
+	if _, ok := cache.Get("b"); ok {
+		t.Fatal("expected key b to be evicted")
+	}
+	if got, ok := cache.Get("c"); !ok || got.Fingerprint() != c.Fingerprint() {
+		t.Fatalf("expected key c to exist, got %v, %v", got, ok)
+	}
+
+	stats := cache.Stats()
+	if stats.Entries != 2 || stats.Capacity != 2 || stats.Evictions != 1 {
+		t.Fatalf("unexpected LRU stats: %+v", stats)
 	}
 }
 

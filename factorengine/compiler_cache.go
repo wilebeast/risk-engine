@@ -1,6 +1,7 @@
 package factorengine
 
 import (
+	"container/list"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -16,11 +17,13 @@ type ProgramCache interface {
 }
 
 type ProgramCacheStats struct {
-	Entries int
-	Gets    uint64
-	Hits    uint64
-	Misses  uint64
-	Sets    uint64
+	Entries   int
+	Capacity  int
+	Gets      uint64
+	Hits      uint64
+	Misses    uint64
+	Sets      uint64
+	Evictions uint64
 }
 
 type ProgramCacheWithStats interface {
@@ -29,12 +32,13 @@ type ProgramCacheWithStats interface {
 }
 
 type InMemoryProgramCache struct {
-	mu    sync.RWMutex
-	items map[string]CompiledExpr
-	gets  atomic.Uint64
-	hits  atomic.Uint64
-	miss  atomic.Uint64
-	sets  atomic.Uint64
+	mu        sync.RWMutex
+	items     map[string]CompiledExpr
+	gets      atomic.Uint64
+	hits      atomic.Uint64
+	miss      atomic.Uint64
+	sets      atomic.Uint64
+	evictions atomic.Uint64
 }
 
 func NewInMemoryProgramCache() *InMemoryProgramCache {
@@ -68,12 +72,107 @@ func (c *InMemoryProgramCache) Stats() ProgramCacheStats {
 	entries := len(c.items)
 	c.mu.RUnlock()
 	return ProgramCacheStats{
-		Entries: entries,
-		Gets:    c.gets.Load(),
-		Hits:    c.hits.Load(),
-		Misses:  c.miss.Load(),
-		Sets:    c.sets.Load(),
+		Entries:   entries,
+		Capacity:  0,
+		Gets:      c.gets.Load(),
+		Hits:      c.hits.Load(),
+		Misses:    c.miss.Load(),
+		Sets:      c.sets.Load(),
+		Evictions: c.evictions.Load(),
 	}
+}
+
+type lruCacheEntry struct {
+	key   string
+	value CompiledExpr
+}
+
+type LRUProgramCache struct {
+	mu        sync.Mutex
+	capacity  int
+	items     map[string]*list.Element
+	order     *list.List
+	gets      atomic.Uint64
+	hits      atomic.Uint64
+	miss      atomic.Uint64
+	sets      atomic.Uint64
+	evictions atomic.Uint64
+}
+
+func NewLRUProgramCache(capacity int) *LRUProgramCache {
+	if capacity <= 0 {
+		capacity = 1
+	}
+	return &LRUProgramCache{
+		capacity: capacity,
+		items:    make(map[string]*list.Element, capacity),
+		order:    list.New(),
+	}
+}
+
+func (c *LRUProgramCache) Get(key string) (CompiledExpr, bool) {
+	c.gets.Add(1)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	elem, ok := c.items[key]
+	if !ok {
+		c.miss.Add(1)
+		return nil, false
+	}
+	c.hits.Add(1)
+	c.order.MoveToFront(elem)
+	entry := elem.Value.(*lruCacheEntry)
+	return entry.value, true
+}
+
+func (c *LRUProgramCache) Set(key string, expr CompiledExpr) {
+	c.sets.Add(1)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if elem, ok := c.items[key]; ok {
+		c.order.MoveToFront(elem)
+		elem.Value.(*lruCacheEntry).value = expr
+		return
+	}
+
+	elem := c.order.PushFront(&lruCacheEntry{
+		key:   key,
+		value: expr,
+	})
+	c.items[key] = elem
+
+	if len(c.items) > c.capacity {
+		c.evictOldest()
+	}
+}
+
+func (c *LRUProgramCache) Stats() ProgramCacheStats {
+	c.mu.Lock()
+	entries := len(c.items)
+	capacity := c.capacity
+	c.mu.Unlock()
+	return ProgramCacheStats{
+		Entries:   entries,
+		Capacity:  capacity,
+		Gets:      c.gets.Load(),
+		Hits:      c.hits.Load(),
+		Misses:    c.miss.Load(),
+		Sets:      c.sets.Load(),
+		Evictions: c.evictions.Load(),
+	}
+}
+
+func (c *LRUProgramCache) evictOldest() {
+	elem := c.order.Back()
+	if elem == nil {
+		return
+	}
+	c.order.Remove(elem)
+	entry := elem.Value.(*lruCacheEntry)
+	delete(c.items, entry.key)
+	c.evictions.Add(1)
 }
 
 type CachedRuleCompiler struct {
