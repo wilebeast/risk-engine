@@ -498,7 +498,8 @@ func TestCachedRuleCompilerHitsCache(t *testing.T) {
 		resultType: ValueTypeBool,
 	}
 	inner := &countingRuleCompiler{result: cachedExpr}
-	compiler := NewCachedRuleCompiler(inner, NewInMemoryProgramCache())
+	cache := NewInMemoryProgramCache()
+	compiler := NewCachedRuleCompiler(inner, cache)
 	registry := FactorRegistry{
 		"f_amount": {
 			FactorCode: "f_amount",
@@ -521,6 +522,10 @@ func TestCachedRuleCompilerHitsCache(t *testing.T) {
 	}
 	if first.Fingerprint() != second.Fingerprint() {
 		t.Fatalf("expected cached compiled expr fingerprint to match, got %q and %q", first.Fingerprint(), second.Fingerprint())
+	}
+	stats := cache.Stats()
+	if stats.Entries != 1 || stats.Gets != 2 || stats.Hits != 1 || stats.Misses != 1 || stats.Sets != 1 {
+		t.Fatalf("unexpected cache stats: %+v", stats)
 	}
 }
 
@@ -1633,4 +1638,100 @@ func BenchmarkCachedRuleCompilerCompile(b *testing.B) {
 			b.Fatalf("Compile returned error: %v", err)
 		}
 	}
+}
+
+func BenchmarkCachedRuleCompilerCompileHot(b *testing.B) {
+	registry := FactorRegistry{
+		"f_amount": {
+			FactorCode: "f_amount",
+			OutputSchema: Schema{
+				"value": {Type: ValueTypeLong, Required: true},
+			},
+		},
+		"f_user_info": {
+			FactorCode: "f_user_info",
+			OutputSchema: Schema{
+				"register_days": {Type: ValueTypeInt, Required: true},
+				"kyc_level":     {Type: ValueTypeString, Required: false},
+			},
+		},
+		"f_is_vip": {
+			FactorCode: "f_is_vip",
+			OutputSchema: Schema{
+				"value": {Type: ValueTypeBool, Required: true},
+			},
+		},
+	}
+	expr := "f_amount > 100000 && f_user_info.register_days < 7 && (isEmpty(f_user_info.kyc_level) ? f_is_vip : false)"
+	cache := NewInMemoryProgramCache()
+	compiler := NewCachedRuleCompiler(NewRuleCompiler(), cache)
+	if _, err := compiler.Compile(expr, registry); err != nil {
+		b.Fatalf("warmup Compile returned error: %v", err)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := compiler.Compile(expr, registry); err != nil {
+			b.Fatalf("Compile returned error: %v", err)
+		}
+	}
+}
+
+func FuzzRuleCompilerCompileAndEval(f *testing.F) {
+	registry := FactorRegistry{
+		"f_amount": {
+			FactorCode: "f_amount",
+			OutputSchema: Schema{
+				"value": {Type: ValueTypeLong, Required: true},
+			},
+		},
+		"f_user_info": {
+			FactorCode: "f_user_info",
+			OutputSchema: Schema{
+				"register_days": {Type: ValueTypeInt, Required: false},
+				"kyc_level":     {Type: ValueTypeString, Required: false},
+			},
+		},
+		"f_is_vip": {
+			FactorCode: "f_is_vip",
+			OutputSchema: Schema{
+				"value": {Type: ValueTypeBool, Required: true},
+			},
+		},
+	}
+	ctx := EvalContext{
+		"f_amount": int64(200000),
+		"f_user_info": map[string]any{
+			"register_days": 3,
+			"kyc_level":     "L2",
+		},
+		"f_is_vip": true,
+	}
+
+	seeds := []string{
+		"f_amount > 100",
+		"f_amount > 100000 && f_user_info.register_days < 7",
+		"isEmpty(f_user_info.kyc_level)",
+		"f_is_vip ? \"vip\" : \"guest\"",
+		"get({\"a\": 1}, \"a\") == 1",
+		"1 / 0",
+		"(",
+		"",
+	}
+	for _, seed := range seeds {
+		f.Add(seed)
+	}
+
+	f.Fuzz(func(t *testing.T, expr string) {
+		compiled, err := NewRuleCompiler().Compile(expr, registry)
+		if err != nil {
+			return
+		}
+		vm := NewBytecodeVMWithConfig(BytecodeVMConfig{
+			MaxSteps:      1024,
+			MaxStackDepth: 256,
+		})
+		_, _ = vm.Eval(compiled.Bytecode(), ctx)
+	})
 }

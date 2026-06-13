@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 type ProgramCache interface {
@@ -14,9 +15,26 @@ type ProgramCache interface {
 	Set(key string, expr CompiledExpr)
 }
 
+type ProgramCacheStats struct {
+	Entries int
+	Gets    uint64
+	Hits    uint64
+	Misses  uint64
+	Sets    uint64
+}
+
+type ProgramCacheWithStats interface {
+	ProgramCache
+	Stats() ProgramCacheStats
+}
+
 type InMemoryProgramCache struct {
 	mu    sync.RWMutex
 	items map[string]CompiledExpr
+	gets  atomic.Uint64
+	hits  atomic.Uint64
+	miss  atomic.Uint64
+	sets  atomic.Uint64
 }
 
 func NewInMemoryProgramCache() *InMemoryProgramCache {
@@ -26,16 +44,36 @@ func NewInMemoryProgramCache() *InMemoryProgramCache {
 }
 
 func (c *InMemoryProgramCache) Get(key string) (CompiledExpr, bool) {
+	c.gets.Add(1)
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	expr, ok := c.items[key]
+	if ok {
+		c.hits.Add(1)
+	} else {
+		c.miss.Add(1)
+	}
 	return expr, ok
 }
 
 func (c *InMemoryProgramCache) Set(key string, expr CompiledExpr) {
+	c.sets.Add(1)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.items[key] = expr
+}
+
+func (c *InMemoryProgramCache) Stats() ProgramCacheStats {
+	c.mu.RLock()
+	entries := len(c.items)
+	c.mu.RUnlock()
+	return ProgramCacheStats{
+		Entries: entries,
+		Gets:    c.gets.Load(),
+		Hits:    c.hits.Load(),
+		Misses:  c.miss.Load(),
+		Sets:    c.sets.Load(),
+	}
 }
 
 type CachedRuleCompiler struct {
