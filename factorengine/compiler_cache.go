@@ -16,6 +16,11 @@ type ProgramCache interface {
 	Set(key string, expr CompiledExpr)
 }
 
+type InvalidatingProgramCache interface {
+	ProgramCache
+	Delete(key string)
+}
+
 type ProgramCacheStats struct {
 	Entries   int
 	Capacity  int
@@ -65,6 +70,12 @@ func (c *InMemoryProgramCache) Set(key string, expr CompiledExpr) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.items[key] = expr
+}
+
+func (c *InMemoryProgramCache) Delete(key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.items, key)
 }
 
 func (c *InMemoryProgramCache) Stats() ProgramCacheStats {
@@ -146,6 +157,17 @@ func (c *LRUProgramCache) Set(key string, expr CompiledExpr) {
 	if len(c.items) > c.capacity {
 		c.evictOldest()
 	}
+}
+
+func (c *LRUProgramCache) Delete(key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	elem, ok := c.items[key]
+	if !ok {
+		return
+	}
+	c.order.Remove(elem)
+	delete(c.items, key)
 }
 
 func (c *LRUProgramCache) Stats() ProgramCacheStats {

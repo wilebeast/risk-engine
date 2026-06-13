@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 type panicAccessor struct{}
@@ -555,6 +556,110 @@ func TestLRUProgramCacheEvictsLeastRecentlyUsed(t *testing.T) {
 	stats := cache.Stats()
 	if stats.Entries != 2 || stats.Capacity != 2 || stats.Evictions != 1 {
 		t.Fatalf("unexpected LRU stats: %+v", stats)
+	}
+}
+
+func TestPersistentProgramCacheRestoresFromFileStore(t *testing.T) {
+	dir := t.TempDir()
+	store := NewFileProgramStore(dir)
+	source := compiledExpr{
+		source: "f_amount > 100",
+		bytecode: BytecodeProgram{
+			Instructions: []Instruction{
+				{Op: OpLoadFactor, Arg: 0},
+				{Op: OpPushConst, Arg: 0},
+				{Op: OpBinaryGT},
+			},
+			Constants:  []any{int64(100)},
+			Accessors:  []ValueAccessor{FactorValueAccessor{FactorCode: "f_amount"}},
+			ResultType: ValueTypeBool,
+		},
+		resultType: ValueTypeBool,
+	}
+
+	writer := NewPersistentProgramCache(store, NewInMemoryProgramCache(), time.Hour)
+	writer.Set("rule-1", source)
+
+	reader := NewPersistentProgramCache(store, NewInMemoryProgramCache(), time.Hour)
+	restored, ok := reader.Get("rule-1")
+	if !ok {
+		t.Fatal("expected persisted rule to be restored")
+	}
+	result, err := restored.Eval(EvalContext{
+		"f_amount": int64(200),
+	})
+	if err != nil {
+		t.Fatalf("Eval returned error: %v", err)
+	}
+	if result != true {
+		t.Fatalf("unexpected restored eval result: %v", result)
+	}
+	if restored.Fingerprint() != source.Fingerprint() {
+		t.Fatalf("expected matching fingerprint, got %q and %q", restored.Fingerprint(), source.Fingerprint())
+	}
+}
+
+func TestPersistentProgramCacheTTLExpiresLocalAndPersistentEntries(t *testing.T) {
+	dir := t.TempDir()
+	store := NewFileProgramStore(dir)
+	now := time.Date(2026, 6, 13, 12, 0, 0, 0, time.UTC)
+	cache := NewPersistentProgramCache(store, NewInMemoryProgramCache(), time.Hour)
+	cache.now = func() time.Time { return now }
+
+	expr := compiledExpr{
+		source:     "true",
+		bytecode:   BytecodeProgram{Instructions: []Instruction{{Op: OpPushConst, Arg: 0}}, Constants: []any{true}, ResultType: ValueTypeBool},
+		resultType: ValueTypeBool,
+	}
+	cache.Set("rule-ttl", expr)
+	if _, ok := cache.Get("rule-ttl"); !ok {
+		t.Fatal("expected warm entry to exist")
+	}
+
+	cache.now = func() time.Time { return now.Add(2 * time.Hour) }
+	if _, ok := cache.Get("rule-ttl"); ok {
+		t.Fatal("expected expired entry to miss")
+	}
+	if _, ok, err := store.Load("rule-ttl"); err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	} else if ok {
+		t.Fatal("expected expired persistent entry to be deleted")
+	}
+}
+
+func TestPersistentProgramCacheInvalidateRemovesStoreAndLocalEntry(t *testing.T) {
+	dir := t.TempDir()
+	store := NewFileProgramStore(dir)
+	local := NewInMemoryProgramCache()
+	cache := NewPersistentProgramCache(store, local, time.Hour)
+
+	expr := compiledExpr{
+		source:     "true",
+		bytecode:   BytecodeProgram{Instructions: []Instruction{{Op: OpPushConst, Arg: 0}}, Constants: []any{true}, ResultType: ValueTypeBool},
+		resultType: ValueTypeBool,
+	}
+	cache.Set("rule-invalidate", expr)
+
+	if err := cache.Invalidate("rule-invalidate"); err != nil {
+		t.Fatalf("Invalidate returned error: %v", err)
+	}
+	if _, ok := local.Get("rule-invalidate"); ok {
+		t.Fatal("expected local cache entry to be removed")
+	}
+	if _, ok, err := store.Load("rule-invalidate"); err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	} else if ok {
+		t.Fatal("expected persistent store entry to be removed")
+	}
+	if cache.Invalidations() != 1 {
+		t.Fatalf("unexpected invalidation count: %d", cache.Invalidations())
+	}
+}
+
+func TestFileProgramStoreDeleteIgnoresMissingFile(t *testing.T) {
+	store := NewFileProgramStore(t.TempDir())
+	if err := store.Delete("missing"); err != nil {
+		t.Fatalf("Delete returned error: %v", err)
 	}
 }
 
