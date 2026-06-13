@@ -1,10 +1,17 @@
 package factorengine
 
 import (
+	"context"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+type panicAccessor struct{}
+
+func (panicAccessor) Get(EvalContext) (any, bool) {
+	panic("accessor boom")
+}
 
 func TestParseFactorRef(t *testing.T) {
 	ref, err := ParseFactorRef("f_user_info.register_days")
@@ -1191,6 +1198,104 @@ func TestBytecodePeepholeRemovesNoOpJump(t *testing.T) {
 		if inst.Op == OpJump && inst.Arg == i+1 {
 			t.Fatalf("found no-op jump at %d\n%s", i, compiled.Bytecode().Disassemble())
 		}
+	}
+}
+
+func TestBytecodeDivisionByZeroReturnsValidationError(t *testing.T) {
+	compiled, err := NewRuleCompiler().Compile("1 / 0", FactorRegistry{})
+	if err != nil {
+		t.Fatalf("Compile returned error: %v", err)
+	}
+
+	_, err = NewBytecodeVM().Eval(compiled.Bytecode(), nil)
+	if err == nil {
+		t.Fatal("expected division by zero error")
+	}
+	if v, ok := err.(ValidationError); !ok || v.Code != ErrDivisionByZero {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestBytecodeCompileRecoversPanics(t *testing.T) {
+	_, err := NewBytecodeCompiler().Compile(BoundFunctionCallExpr{
+		Name:  "panicFold",
+		Type:  ValueTypeInt,
+		Field: scalarField(ValueTypeInt),
+		Evaluator: func(args []BoundExpr, ctx EvalContext) (any, error) {
+			panic("compile boom")
+		},
+	})
+	if err == nil {
+		t.Fatal("expected compile panic recovery error")
+	}
+	if v, ok := err.(ValidationError); !ok || v.Code != ErrInternalPanic {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestBytecodeEvalRecoversPanics(t *testing.T) {
+	_, err := NewBytecodeVM().Eval(BytecodeProgram{
+		Instructions: []Instruction{{Op: OpLoadFactor, Arg: 0}},
+		Accessors:    []ValueAccessor{panicAccessor{}},
+	}, EvalContext{})
+	if err == nil {
+		t.Fatal("expected eval panic recovery error")
+	}
+	if v, ok := err.(ValidationError); !ok || v.Code != ErrInternalPanic {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestBytecodeVMMaxStepsBudget(t *testing.T) {
+	_, err := NewBytecodeVMWithConfig(BytecodeVMConfig{
+		MaxSteps:      3,
+		MaxStackDepth: 16,
+	}).Eval(BytecodeProgram{
+		Instructions: []Instruction{{Op: OpJump, Arg: 0}},
+	}, EvalContext{})
+	if err == nil {
+		t.Fatal("expected step budget error")
+	}
+	if v, ok := err.(ValidationError); !ok || v.Code != ErrExecutionBudget || v.Field != "steps" {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestBytecodeVMMaxStackBudget(t *testing.T) {
+	_, err := NewBytecodeVMWithConfig(BytecodeVMConfig{
+		MaxSteps:      8,
+		MaxStackDepth: 1,
+	}).Eval(BytecodeProgram{
+		Instructions: []Instruction{
+			{Op: OpPushConst, Arg: 0},
+			{Op: OpPushConst, Arg: 1},
+		},
+		Constants: []any{1, 2},
+	}, EvalContext{})
+	if err == nil {
+		t.Fatal("expected stack budget error")
+	}
+	if v, ok := err.(ValidationError); !ok || v.Code != ErrExecutionBudget || v.Field != "stack" {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestBytecodeVMContextCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := NewBytecodeVMWithConfig(BytecodeVMConfig{
+		Context:       ctx,
+		MaxSteps:      8,
+		MaxStackDepth: 8,
+	}).Eval(BytecodeProgram{
+		Instructions: []Instruction{{Op: OpJump, Arg: 0}},
+	}, EvalContext{})
+	if err == nil {
+		t.Fatal("expected execution cancelled error")
+	}
+	if v, ok := err.(ValidationError); !ok || v.Code != ErrExecutionCancelled {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 

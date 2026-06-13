@@ -610,6 +610,9 @@ func arithmetic(left, right any, op string) (any, error) {
 		case "*":
 			return leftNum.float64 * rightNum.float64, nil
 		case "/":
+			if rightNum.float64 == 0 {
+				return nil, ValidationError{Code: ErrDivisionByZero, Message: "division by zero"}
+			}
 			return leftNum.float64 / rightNum.float64, nil
 		}
 	}
@@ -621,6 +624,9 @@ func arithmetic(left, right any, op string) (any, error) {
 	case "*":
 		return leftNum.int64 * rightNum.int64, nil
 	case "/":
+		if rightNum.int64 == 0 {
+			return nil, ValidationError{Code: ErrDivisionByZero, Message: "division by zero"}
+		}
 		return leftNum.int64 / rightNum.int64, nil
 	}
 	return nil, ValidationError{Code: ErrUnsupportedOperator, Message: fmt.Sprintf("unsupported arithmetic operator %q", op)}

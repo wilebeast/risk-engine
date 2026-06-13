@@ -1,6 +1,7 @@
 package factorengine
 
 import (
+	"context"
 	"fmt"
 	"strings"
 )
@@ -51,6 +52,12 @@ type TraceStep struct {
 	StackAfter  []any
 }
 
+type BytecodeVMConfig struct {
+	Context       context.Context
+	MaxSteps      int
+	MaxStackDepth int
+}
+
 type BytecodeCompiler struct {
 	constIndex    map[string]int
 	accessorIndex map[string]int
@@ -75,6 +82,11 @@ func (p BytecodeProgram) Disassemble() string {
 	}
 	return strings.Join(lines, "\n")
 }
+
+const (
+	defaultMaxSteps      = 10000
+	defaultMaxStackDepth = 1024
+)
 
 func (p BytecodeProgram) formatInstruction(inst Instruction) string {
 	switch inst.Op {
@@ -132,8 +144,13 @@ func (p BytecodeProgram) formatInstruction(inst Instruction) string {
 	}
 }
 
-func (c *BytecodeCompiler) Compile(expr BoundExpr) (BytecodeProgram, error) {
-	expr, err := c.optimizeBoundExpr(expr)
+func (c *BytecodeCompiler) Compile(expr BoundExpr) (_ BytecodeProgram, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = panicAsValidationError("bytecode_compile", r)
+		}
+	}()
+	expr, err = c.optimizeBoundExpr(expr)
 	if err != nil {
 		return BytecodeProgram{}, err
 	}
@@ -527,10 +544,25 @@ func binaryOpcode(op string) (OpCode, error) {
 	}
 }
 
-type BytecodeVM struct{}
+type BytecodeVM struct {
+	config BytecodeVMConfig
+}
 
 func NewBytecodeVM() *BytecodeVM {
-	return &BytecodeVM{}
+	return NewBytecodeVMWithConfig(BytecodeVMConfig{})
+}
+
+func NewBytecodeVMWithConfig(config BytecodeVMConfig) *BytecodeVM {
+	if config.Context == nil {
+		config.Context = context.Background()
+	}
+	if config.MaxSteps <= 0 {
+		config.MaxSteps = defaultMaxSteps
+	}
+	if config.MaxStackDepth <= 0 {
+		config.MaxStackDepth = defaultMaxStackDepth
+	}
+	return &BytecodeVM{config: config}
 }
 
 func (vm *BytecodeVM) Eval(program BytecodeProgram, ctx EvalContext) (any, error) {
@@ -544,10 +576,24 @@ func (vm *BytecodeVM) Trace(program BytecodeProgram, ctx EvalContext) ([]TraceSt
 }
 
 func (vm *BytecodeVM) eval(program BytecodeProgram, ctx EvalContext, trace bool) (any, []TraceStep, error) {
+	return vm.evalSafe(program, ctx, trace)
+}
+
+func (vm *BytecodeVM) evalSafe(program BytecodeProgram, ctx EvalContext, trace bool) (_ any, _ []TraceStep, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = panicAsValidationError("bytecode_eval", r)
+		}
+	}()
 	stack := make([]any, 0, 16)
 	var steps []TraceStep
 	ip := 0
+	executed := 0
 	for ip < len(program.Instructions) {
+		if err := vm.checkExecutionLimits(executed, len(stack)); err != nil {
+			return nil, steps, err
+		}
+		executed++
 		inst := program.Instructions[ip]
 		var before []any
 		if trace {
@@ -629,6 +675,9 @@ func (vm *BytecodeVM) eval(program BytecodeProgram, ctx EvalContext, trace bool)
 				return nil, steps, err
 			}
 			if !truthyBool(value) {
+				if err := vm.validateJumpTarget(inst.Arg, len(program.Instructions)); err != nil {
+					return nil, steps, err
+				}
 				if trace {
 					steps = append(steps, TraceStep{
 						IP:          ip,
@@ -646,6 +695,9 @@ func (vm *BytecodeVM) eval(program BytecodeProgram, ctx EvalContext, trace bool)
 				return nil, steps, err
 			}
 			if truthyBool(value) {
+				if err := vm.validateJumpTarget(inst.Arg, len(program.Instructions)); err != nil {
+					return nil, steps, err
+				}
 				if trace {
 					steps = append(steps, TraceStep{
 						IP:          ip,
@@ -658,6 +710,9 @@ func (vm *BytecodeVM) eval(program BytecodeProgram, ctx EvalContext, trace bool)
 				continue
 			}
 		case OpJump:
+			if err := vm.validateJumpTarget(inst.Arg, len(program.Instructions)); err != nil {
+				return nil, steps, err
+			}
 			if trace {
 				steps = append(steps, TraceStep{
 					IP:          ip,
@@ -686,6 +741,13 @@ func (vm *BytecodeVM) eval(program BytecodeProgram, ctx EvalContext, trace bool)
 		default:
 			return nil, steps, ValidationError{Code: ErrExpressionInvalid, Message: fmt.Sprintf("unsupported opcode %d", inst.Op)}
 		}
+		if len(stack) > vm.config.MaxStackDepth {
+			return nil, steps, ValidationError{
+				Code:    ErrExecutionBudget,
+				Field:   "stack",
+				Message: fmt.Sprintf("max stack depth exceeded: %d > %d", len(stack), vm.config.MaxStackDepth),
+			}
+		}
 		if trace {
 			steps = append(steps, TraceStep{
 				IP:          ip,
@@ -700,6 +762,38 @@ func (vm *BytecodeVM) eval(program BytecodeProgram, ctx EvalContext, trace bool)
 		return nil, steps, ValidationError{Code: ErrExpressionInvalid, Message: "vm finished with invalid stack state"}
 	}
 	return stack[0], steps, nil
+}
+
+func (vm *BytecodeVM) checkExecutionLimits(executed int, stackDepth int) error {
+	if err := vm.config.Context.Err(); err != nil {
+		return ValidationError{Code: ErrExecutionCancelled, Message: err.Error()}
+	}
+	if executed >= vm.config.MaxSteps {
+		return ValidationError{
+			Code:    ErrExecutionBudget,
+			Field:   "steps",
+			Message: fmt.Sprintf("max steps exceeded: %d", vm.config.MaxSteps),
+		}
+	}
+	if stackDepth > vm.config.MaxStackDepth {
+		return ValidationError{
+			Code:    ErrExecutionBudget,
+			Field:   "stack",
+			Message: fmt.Sprintf("max stack depth exceeded: %d > %d", stackDepth, vm.config.MaxStackDepth),
+		}
+	}
+	return nil
+}
+
+func (vm *BytecodeVM) validateJumpTarget(target int, instructionCount int) error {
+	if target < 0 || target > instructionCount {
+		return ValidationError{
+			Code:    ErrExpressionInvalid,
+			Field:   "jump",
+			Message: fmt.Sprintf("invalid jump target %d", target),
+		}
+	}
+	return nil
 }
 
 func (vm *BytecodeVM) pop(stack *[]any) (any, error) {
@@ -753,5 +847,13 @@ func evalBuiltinValues(name string, args []any) (any, error) {
 		return builtinGet(args)
 	default:
 		return nil, ValidationError{Code: ErrUnknownFunction, Field: name, Message: "unknown function"}
+	}
+}
+
+func panicAsValidationError(field string, recovered any) ValidationError {
+	return ValidationError{
+		Code:    ErrInternalPanic,
+		Field:   field,
+		Message: fmt.Sprintf("recovered panic: %v", recovered),
 	}
 }

@@ -85,6 +85,10 @@ const (
 	ErrUnsupportedOperator  ValidationErrorCode = "UNSUPPORTED_OPERATOR"
 	ErrUnknownFunction      ValidationErrorCode = "UNKNOWN_FUNCTION"
 	ErrInvalidArgumentCount ValidationErrorCode = "INVALID_ARGUMENT_COUNT"
+	ErrDivisionByZero       ValidationErrorCode = "DIVISION_BY_ZERO"
+	ErrExecutionBudget      ValidationErrorCode = "EXECUTION_BUDGET_EXCEEDED"
+	ErrExecutionCancelled   ValidationErrorCode = "EXECUTION_CANCELLED"
+	ErrInternalPanic        ValidationErrorCode = "INTERNAL_PANIC"
 )
 
 type ValidationError struct {
