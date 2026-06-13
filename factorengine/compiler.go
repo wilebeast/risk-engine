@@ -6,6 +6,7 @@ type CompiledExpr interface {
 	Bound() BoundExpr
 	Bytecode() BytecodeProgram
 	ResultType() ValueType
+	Fingerprint() string
 	Eval(ctx EvalContext) (any, error)
 }
 
@@ -75,6 +76,10 @@ func (c compiledExpr) Bytecode() BytecodeProgram {
 
 func (c compiledExpr) ResultType() ValueType {
 	return c.resultType
+}
+
+func (c compiledExpr) Fingerprint() string {
+	return c.bytecode.Fingerprint()
 }
 
 func (c compiledExpr) Eval(ctx EvalContext) (any, error) {

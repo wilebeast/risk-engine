@@ -2,6 +2,8 @@ package factorengine
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"strings"
 )
@@ -81,6 +83,39 @@ func (p BytecodeProgram) Disassemble() string {
 		lines = append(lines, fmt.Sprintf("%03d  %s", ip, p.formatInstruction(inst)))
 	}
 	return strings.Join(lines, "\n")
+}
+
+func (p BytecodeProgram) Fingerprint() string {
+	sum := sha256.Sum256([]byte(p.fingerprintSource()))
+	return hex.EncodeToString(sum[:])
+}
+
+func (p BytecodeProgram) fingerprintSource() string {
+	var builder strings.Builder
+	builder.WriteString("result=")
+	builder.WriteString(string(p.ResultType))
+	builder.WriteByte('|')
+
+	for _, inst := range p.Instructions {
+		builder.WriteString(fmt.Sprintf("%d:%d:%d;", inst.Op, inst.Arg, inst.Aux))
+	}
+	builder.WriteByte('|')
+
+	for _, constant := range p.Constants {
+		builder.WriteString(fmt.Sprintf("%T=%#v;", constant, constant))
+	}
+	builder.WriteByte('|')
+
+	for _, accessor := range p.Accessors {
+		builder.WriteString(fmt.Sprintf("%#v;", accessor))
+	}
+	builder.WriteByte('|')
+
+	for _, builtin := range p.Builtins {
+		builder.WriteString(builtin)
+		builder.WriteByte(';')
+	}
+	return builder.String()
 }
 
 const (

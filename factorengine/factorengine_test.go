@@ -13,6 +13,21 @@ func (panicAccessor) Get(EvalContext) (any, bool) {
 	panic("accessor boom")
 }
 
+type countingRuleCompiler struct {
+	compileCalls int
+	result       CompiledExpr
+	err          error
+}
+
+func (c *countingRuleCompiler) TypeCheck(expr string, registry FactorRegistry) (ValueType, error) {
+	return ValueTypeBool, nil
+}
+
+func (c *countingRuleCompiler) Compile(expr string, registry FactorRegistry) (CompiledExpr, error) {
+	c.compileCalls++
+	return c.result, c.err
+}
+
 func TestParseFactorRef(t *testing.T) {
 	ref, err := ParseFactorRef("f_user_info.register_days")
 	if err != nil {
@@ -418,6 +433,94 @@ func TestRuleCompilerTypeCheckAndCompile(t *testing.T) {
 	}
 	if compiled.Bytecode().ResultType != ValueTypeBool {
 		t.Fatalf("unexpected bytecode result type: %s", compiled.Bytecode().ResultType)
+	}
+	if compiled.Fingerprint() == "" {
+		t.Fatal("expected compiled fingerprint")
+	}
+}
+
+func TestBytecodeProgramFingerprintStable(t *testing.T) {
+	program := BytecodeProgram{
+		Instructions: []Instruction{
+			{Op: OpPushConst, Arg: 0},
+			{Op: OpPushConst, Arg: 1},
+			{Op: OpBinaryAdd},
+		},
+		Constants:  []any{1, 2},
+		ResultType: ValueTypeLong,
+	}
+
+	first := program.Fingerprint()
+	second := program.Fingerprint()
+	if first == "" {
+		t.Fatal("expected non-empty fingerprint")
+	}
+	if first != second {
+		t.Fatalf("expected stable fingerprint, got %q and %q", first, second)
+	}
+}
+
+func TestBuildCompileCacheKeyChangesWithRegistry(t *testing.T) {
+	base := FactorRegistry{
+		"f_amount": {
+			FactorCode: "f_amount",
+			OutputSchema: Schema{
+				"value": {Type: ValueTypeLong, Required: true},
+			},
+		},
+	}
+	changed := FactorRegistry{
+		"f_amount": {
+			FactorCode: "f_amount",
+			OutputSchema: Schema{
+				"value": {Type: ValueTypeInt, Required: true},
+			},
+		},
+	}
+
+	baseKey, err := BuildCompileCacheKey("f_amount > 100", base)
+	if err != nil {
+		t.Fatalf("BuildCompileCacheKey returned error: %v", err)
+	}
+	changedKey, err := BuildCompileCacheKey("f_amount > 100", changed)
+	if err != nil {
+		t.Fatalf("BuildCompileCacheKey returned error: %v", err)
+	}
+	if baseKey == changedKey {
+		t.Fatal("expected different cache keys for different registries")
+	}
+}
+
+func TestCachedRuleCompilerHitsCache(t *testing.T) {
+	cachedExpr := compiledExpr{
+		source:     "f_amount > 100",
+		bytecode:   BytecodeProgram{Instructions: []Instruction{{Op: OpPushConst, Arg: 0}}, Constants: []any{true}, ResultType: ValueTypeBool},
+		resultType: ValueTypeBool,
+	}
+	inner := &countingRuleCompiler{result: cachedExpr}
+	compiler := NewCachedRuleCompiler(inner, NewInMemoryProgramCache())
+	registry := FactorRegistry{
+		"f_amount": {
+			FactorCode: "f_amount",
+			OutputSchema: Schema{
+				"value": {Type: ValueTypeLong, Required: true},
+			},
+		},
+	}
+
+	first, err := compiler.Compile("f_amount > 100", registry)
+	if err != nil {
+		t.Fatalf("first Compile returned error: %v", err)
+	}
+	second, err := compiler.Compile("f_amount > 100", registry)
+	if err != nil {
+		t.Fatalf("second Compile returned error: %v", err)
+	}
+	if inner.compileCalls != 1 {
+		t.Fatalf("expected one inner compile, got %d", inner.compileCalls)
+	}
+	if first.Fingerprint() != second.Fingerprint() {
+		t.Fatalf("expected cached compiled expr fingerprint to match, got %q and %q", first.Fingerprint(), second.Fingerprint())
 	}
 }
 
@@ -1464,5 +1567,70 @@ func TestCompiledExprEvalArithmeticAndNullSemantics(t *testing.T) {
 	}
 	if nilArithmetic != nil {
 		t.Fatalf("expected nil arithmetic result, got %#v", nilArithmetic)
+	}
+}
+
+func BenchmarkRuleCompilerCompile(b *testing.B) {
+	registry := FactorRegistry{
+		"f_amount": {
+			FactorCode: "f_amount",
+			OutputSchema: Schema{
+				"value": {Type: ValueTypeLong, Required: true},
+			},
+		},
+		"f_user_info": {
+			FactorCode: "f_user_info",
+			OutputSchema: Schema{
+				"register_days": {Type: ValueTypeInt, Required: true},
+				"kyc_level":     {Type: ValueTypeString, Required: false},
+			},
+		},
+		"f_is_vip": {
+			FactorCode: "f_is_vip",
+			OutputSchema: Schema{
+				"value": {Type: ValueTypeBool, Required: true},
+			},
+		},
+	}
+	expr := "f_amount > 100000 && f_user_info.register_days < 7 && (isEmpty(f_user_info.kyc_level) ? f_is_vip : false)"
+
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if _, err := NewRuleCompiler().Compile(expr, registry); err != nil {
+			b.Fatalf("Compile returned error: %v", err)
+		}
+	}
+}
+
+func BenchmarkCachedRuleCompilerCompile(b *testing.B) {
+	registry := FactorRegistry{
+		"f_amount": {
+			FactorCode: "f_amount",
+			OutputSchema: Schema{
+				"value": {Type: ValueTypeLong, Required: true},
+			},
+		},
+		"f_user_info": {
+			FactorCode: "f_user_info",
+			OutputSchema: Schema{
+				"register_days": {Type: ValueTypeInt, Required: true},
+				"kyc_level":     {Type: ValueTypeString, Required: false},
+			},
+		},
+		"f_is_vip": {
+			FactorCode: "f_is_vip",
+			OutputSchema: Schema{
+				"value": {Type: ValueTypeBool, Required: true},
+			},
+		},
+	}
+	expr := "f_amount > 100000 && f_user_info.register_days < 7 && (isEmpty(f_user_info.kyc_level) ? f_is_vip : false)"
+	compiler := NewCachedRuleCompiler(NewRuleCompiler(), NewInMemoryProgramCache())
+
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if _, err := compiler.Compile(expr, registry); err != nil {
+			b.Fatalf("Compile returned error: %v", err)
+		}
 	}
 }
