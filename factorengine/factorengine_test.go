@@ -734,6 +734,87 @@ func TestObservedRuleCompilerRecordsCompileErrors(t *testing.T) {
 	}
 }
 
+func TestEngineCompileAndEvalUsesCacheAndObserver(t *testing.T) {
+	registry := FactorRegistry{
+		"f_amount": {
+			FactorCode: "f_amount",
+			OutputSchema: Schema{
+				"value": {Type: ValueTypeLong, Required: true},
+			},
+		},
+	}
+	observer := NewInMemoryRuleObserver()
+	cache := NewLRUProgramCache(8)
+	engine := NewEngine(EngineConfig{
+		Registry: registry,
+		Cache:    cache,
+		Observer: observer,
+	})
+
+	first, err := engine.Compile("f_amount > 100")
+	if err != nil {
+		t.Fatalf("first Compile returned error: %v", err)
+	}
+	second, err := engine.Compile("f_amount > 100")
+	if err != nil {
+		t.Fatalf("second Compile returned error: %v", err)
+	}
+	if first.Fingerprint() != second.Fingerprint() {
+		t.Fatalf("expected matching fingerprints, got %q and %q", first.Fingerprint(), second.Fingerprint())
+	}
+
+	result, err := engine.Eval("f_amount > 100", EvalContext{
+		"f_amount": int64(200),
+	})
+	if err != nil {
+		t.Fatalf("Eval returned error: %v", err)
+	}
+	if result != true {
+		t.Fatalf("unexpected eval result: %v", result)
+	}
+
+	cacheStats := cache.Stats()
+	if cacheStats.Gets != 3 || cacheStats.Hits != 2 || cacheStats.Misses != 1 {
+		t.Fatalf("unexpected cache stats: %+v", cacheStats)
+	}
+	observerStats := observer.Stats()
+	if observerStats.CompileCount != 3 || observerStats.CacheRequests != 3 || observerStats.CacheHits != 2 || observerStats.CacheMisses != 1 {
+		t.Fatalf("unexpected observer stats: %+v", observerStats)
+	}
+}
+
+func TestEngineEvalUsesVMConfig(t *testing.T) {
+	registry := FactorRegistry{
+		"f_loop": {
+			FactorCode: "f_loop",
+			OutputSchema: Schema{
+				"value": {Type: ValueTypeBool, Required: true},
+			},
+		},
+	}
+	engine := NewEngine(EngineConfig{
+		Registry: registry,
+		VMConfig: BytecodeVMConfig{
+			MaxSteps:      1,
+			MaxStackDepth: 8,
+		},
+	})
+
+	compiled, err := engine.Compile("f_loop ? true : false")
+	if err != nil {
+		t.Fatalf("Compile returned error: %v", err)
+	}
+	_, err = compiled.Eval(EvalContext{
+		"f_loop": true,
+	})
+	if err == nil {
+		t.Fatal("expected vm budget error")
+	}
+	if v, ok := err.(ValidationError); !ok || v.Code != ErrExecutionBudget {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestCompileFactorAccessor(t *testing.T) {
 	factor := &FactorDefinition{
 		FactorCode: "f_user_info",
