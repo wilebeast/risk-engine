@@ -133,10 +133,15 @@ func (p BytecodeProgram) formatInstruction(inst Instruction) string {
 }
 
 func (c *BytecodeCompiler) Compile(expr BoundExpr) (BytecodeProgram, error) {
+	expr, err := c.optimizeBoundExpr(expr)
+	if err != nil {
+		return BytecodeProgram{}, err
+	}
 	var instructions []Instruction
 	if err := c.emitExpr(expr, &instructions); err != nil {
 		return BytecodeProgram{}, err
 	}
+	instructions = optimizeInstructions(instructions)
 	return BytecodeProgram{
 		Instructions: instructions,
 		Constants:    append([]any(nil), c.constants...),
@@ -144,6 +149,215 @@ func (c *BytecodeCompiler) Compile(expr BoundExpr) (BytecodeProgram, error) {
 		Builtins:     append([]string(nil), c.builtins...),
 		ResultType:   expr.ResultType(),
 	}, nil
+}
+
+func (c *BytecodeCompiler) optimizeBoundExpr(expr BoundExpr) (BoundExpr, error) {
+	switch e := expr.(type) {
+	case BoundLiteralExpr:
+		return e, nil
+	case BoundFactorRefExpr:
+		return e, nil
+	case BoundListExpr:
+		elems := make([]BoundExpr, 0, len(e.Elements))
+		allLiteral := true
+		for _, elem := range e.Elements {
+			opt, err := c.optimizeBoundExpr(elem)
+			if err != nil {
+				return nil, err
+			}
+			if _, ok := opt.(BoundLiteralExpr); !ok {
+				allLiteral = false
+			}
+			elems = append(elems, opt)
+		}
+		e.Elements = elems
+		if allLiteral {
+			value, err := e.Eval(nil)
+			if err != nil {
+				return e, nil
+			}
+			return BoundLiteralExpr{Value: value, Type: e.Type, Field: e.Field}, nil
+		}
+		return e, nil
+	case BoundMapExpr:
+		entries := make([]BoundMapEntry, 0, len(e.Entries))
+		allLiteral := true
+		for _, entry := range e.Entries {
+			opt, err := c.optimizeBoundExpr(entry.Value)
+			if err != nil {
+				return nil, err
+			}
+			if _, ok := opt.(BoundLiteralExpr); !ok {
+				allLiteral = false
+			}
+			entries = append(entries, BoundMapEntry{Key: entry.Key, Value: opt})
+		}
+		e.Entries = entries
+		if allLiteral {
+			value, err := e.Eval(nil)
+			if err != nil {
+				return e, nil
+			}
+			return BoundLiteralExpr{Value: value, Type: e.Type, Field: e.Field}, nil
+		}
+		return e, nil
+	case BoundUnaryExpr:
+		optExpr, err := c.optimizeBoundExpr(e.Expr)
+		if err != nil {
+			return nil, err
+		}
+		e.Expr = optExpr
+		if lit, ok := optExpr.(BoundLiteralExpr); ok {
+			value, err := e.Evaluator(lit.Value)
+			if err == nil {
+				return BoundLiteralExpr{Value: value, Type: e.Type, Field: e.Field}, nil
+			}
+		}
+		return e, nil
+	case BoundBinaryExpr:
+		left, err := c.optimizeBoundExpr(e.Left)
+		if err != nil {
+			return nil, err
+		}
+		right, err := c.optimizeBoundExpr(e.Right)
+		if err != nil {
+			return nil, err
+		}
+		e.Left = left
+		e.Right = right
+		if lit, ok := foldBinaryIfPossible(e); ok {
+			return lit, nil
+		}
+		return e, nil
+	case BoundConditionalExpr:
+		cond, err := c.optimizeBoundExpr(e.Cond)
+		if err != nil {
+			return nil, err
+		}
+		thenExpr, err := c.optimizeBoundExpr(e.Then)
+		if err != nil {
+			return nil, err
+		}
+		elseExpr, err := c.optimizeBoundExpr(e.Else)
+		if err != nil {
+			return nil, err
+		}
+		e.Cond = cond
+		e.Then = thenExpr
+		e.Else = elseExpr
+		if lit, ok := cond.(BoundLiteralExpr); ok {
+			if truthyBool(lit.Value) {
+				return thenExpr, nil
+			}
+			return elseExpr, nil
+		}
+		return e, nil
+	case BoundFunctionCallExpr:
+		args := make([]BoundExpr, 0, len(e.Args))
+		allLiteral := true
+		for _, arg := range e.Args {
+			opt, err := c.optimizeBoundExpr(arg)
+			if err != nil {
+				return nil, err
+			}
+			if _, ok := opt.(BoundLiteralExpr); !ok {
+				allLiteral = false
+			}
+			args = append(args, opt)
+		}
+		e.Args = args
+		if allLiteral {
+			value, err := e.Eval(nil)
+			if err == nil {
+				return BoundLiteralExpr{Value: value, Type: e.Type, Field: e.Field}, nil
+			}
+		}
+		return e, nil
+	default:
+		return expr, nil
+	}
+}
+
+func foldBinaryIfPossible(expr BoundBinaryExpr) (BoundLiteralExpr, bool) {
+	leftLit, leftOK := expr.Left.(BoundLiteralExpr)
+	rightLit, rightOK := expr.Right.(BoundLiteralExpr)
+
+	switch expr.Op {
+	case "&&":
+		if leftOK {
+			if !truthyBool(leftLit.Value) {
+				return BoundLiteralExpr{Value: false, Type: expr.Type, Field: expr.Field}, true
+			}
+			if rightOK {
+				return BoundLiteralExpr{Value: truthyBool(rightLit.Value), Type: expr.Type, Field: expr.Field}, true
+			}
+		}
+	case "||":
+		if leftOK {
+			if truthyBool(leftLit.Value) {
+				return BoundLiteralExpr{Value: true, Type: expr.Type, Field: expr.Field}, true
+			}
+			if rightOK {
+				return BoundLiteralExpr{Value: truthyBool(rightLit.Value), Type: expr.Type, Field: expr.Field}, true
+			}
+		}
+	}
+
+	if !leftOK || !rightOK {
+		return BoundLiteralExpr{}, false
+	}
+	value, err := expr.Evaluator(leftLitWrap(leftLit), leftLitWrap(rightLit), nil)
+	if err != nil {
+		return BoundLiteralExpr{}, false
+	}
+	return BoundLiteralExpr{Value: value, Type: expr.Type, Field: expr.Field}, true
+}
+
+type literalBoundExpr struct {
+	BoundLiteralExpr
+}
+
+func leftLitWrap(lit BoundLiteralExpr) BoundExpr {
+	return literalBoundExpr{BoundLiteralExpr: lit}
+}
+
+func optimizeInstructions(instructions []Instruction) []Instruction {
+	if len(instructions) == 0 {
+		return instructions
+	}
+	keep := make([]bool, len(instructions))
+	for i := range keep {
+		keep[i] = true
+	}
+	for i, inst := range instructions {
+		if inst.Op == OpJump && inst.Arg == i+1 {
+			keep[i] = false
+		}
+	}
+	indexMap := make([]int, len(instructions)+1)
+	next := 0
+	for i := range instructions {
+		indexMap[i] = next
+		if keep[i] {
+			next++
+		}
+	}
+	indexMap[len(instructions)] = next
+
+	optimized := make([]Instruction, 0, next)
+	for i, inst := range instructions {
+		if !keep[i] {
+			continue
+		}
+		switch inst.Op {
+		case OpJump, OpJumpIfFalse, OpJumpIfTrue:
+			if inst.Arg >= 0 && inst.Arg <= len(instructions) {
+				inst.Arg = indexMap[inst.Arg]
+			}
+		}
+		optimized = append(optimized, inst)
+	}
+	return optimized
 }
 
 func (c *BytecodeCompiler) emitExpr(expr BoundExpr, instructions *[]Instruction) error {

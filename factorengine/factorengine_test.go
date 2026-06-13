@@ -1150,6 +1150,50 @@ func TestBytecodeVMTrace(t *testing.T) {
 	}
 }
 
+func TestBytecodeConstantFolding(t *testing.T) {
+	compiled, err := NewRuleCompiler().Compile("true ? (1 + 2) : (3 + 4)", FactorRegistry{})
+	if err != nil {
+		t.Fatalf("Compile returned error: %v", err)
+	}
+
+	bytecode := compiled.Bytecode()
+	if len(bytecode.Instructions) != 1 {
+		t.Fatalf("expected constant-folded single instruction, got %d\n%s", len(bytecode.Instructions), bytecode.Disassemble())
+	}
+	if bytecode.Instructions[0].Op != OpPushConst {
+		t.Fatalf("expected PUSH_CONST after folding, got %v", bytecode.Instructions[0].Op)
+	}
+
+	result, err := NewBytecodeVM().Eval(bytecode, nil)
+	if err != nil {
+		t.Fatalf("VM Eval returned error: %v", err)
+	}
+	if result != int64(3) {
+		t.Fatalf("unexpected folded result: %#v", result)
+	}
+}
+
+func TestBytecodePeepholeRemovesNoOpJump(t *testing.T) {
+	compiled, err := NewRuleCompiler().Compile("f_is_vip ? true : false", FactorRegistry{
+		"f_is_vip": {
+			FactorCode: "f_is_vip",
+			OutputSchema: Schema{
+				"value": {Type: ValueTypeBool, Required: true},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Compile returned error: %v", err)
+	}
+
+	instructions := compiled.Bytecode().Instructions
+	for i, inst := range instructions {
+		if inst.Op == OpJump && inst.Arg == i+1 {
+			t.Fatalf("found no-op jump at %d\n%s", i, compiled.Bytecode().Disassemble())
+		}
+	}
+}
+
 func TestBytecodeVMConditionalAndGet(t *testing.T) {
 	registry := FactorRegistry{
 		"f_device_info": {
