@@ -1,5 +1,7 @@
 package factorengine
 
+import "time"
+
 type EngineConfig struct {
 	Registry FactorRegistry
 	Compiler RuleCompiler
@@ -73,7 +75,16 @@ type engineCompiledExpr struct {
 }
 
 func (c engineCompiledExpr) Eval(ctx EvalContext) (any, error) {
+	start := time.Now()
 	vm := NewBytecodeVMWithConfig(c.vmConfig)
 	result, err := vm.Eval(c.Bytecode(), ctx)
+	if c.observer != nil {
+		c.observer.ObserveEval(EvalObservation{
+			Expr:        c.Source(),
+			Fingerprint: c.Fingerprint(),
+			Duration:    time.Since(start),
+			Err:         err,
+		})
+	}
 	return result, err
 }

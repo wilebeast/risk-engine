@@ -815,6 +815,145 @@ func TestEngineEvalUsesVMConfig(t *testing.T) {
 	}
 }
 
+func TestEngineServicePublishLoadAndEval(t *testing.T) {
+	registry := FactorRegistry{
+		"f_amount": {
+			FactorCode: "f_amount",
+			OutputSchema: Schema{
+				"value": {Type: ValueTypeLong, Required: true},
+			},
+		},
+		"f_is_vip": {
+			FactorCode: "f_is_vip",
+			OutputSchema: Schema{
+				"value": {Type: ValueTypeBool, Required: true},
+			},
+		},
+	}
+	cache := NewLRUProgramCache(16)
+	observer := NewInMemoryRuleObserver()
+	service := NewEngineService(EngineServiceConfig{
+		Registry: registry,
+		Cache:    cache,
+		Observer: observer,
+	})
+
+	published, err := service.PublishRuleSet(RuleSetDefinition{
+		RuleSetCode: "credit_risk",
+		Version:     1,
+		Rules: []RuleDefinition{
+			{RuleCode: "r_amount", Expression: "f_amount > 100"},
+			{RuleCode: "r_vip", Expression: "f_is_vip ? 1 : 0"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("PublishRuleSet returned error: %v", err)
+	}
+	if len(published.Compiled) != 2 {
+		t.Fatalf("expected 2 compiled rules, got %d", len(published.Compiled))
+	}
+
+	loaded, ok := service.LoadRuleSet("credit_risk", 1)
+	if !ok {
+		t.Fatal("expected published ruleset to load")
+	}
+	if loaded.Definition.RuleSetCode != "credit_risk" || loaded.Definition.Version != 1 {
+		t.Fatalf("unexpected loaded ruleset: %+v", loaded.Definition)
+	}
+
+	result, err := service.EvalRule("credit_risk", 1, "r_amount", EvalContext{
+		"f_amount": int64(200),
+	})
+	if err != nil {
+		t.Fatalf("EvalRule returned error: %v", err)
+	}
+	if result != true {
+		t.Fatalf("unexpected EvalRule result: %v", result)
+	}
+
+	latest, ok := service.LoadLatestRuleSet("credit_risk")
+	if !ok || latest.Definition.Version != 1 {
+		t.Fatalf("unexpected latest ruleset: %v, %v", latest, ok)
+	}
+	observerStats := observer.Stats()
+	if observerStats.CompileCount != 2 || observerStats.EvalCount != 1 {
+		t.Fatalf("unexpected observer stats: %+v", observerStats)
+	}
+}
+
+func TestEngineServicePublishRejectsInvalidRule(t *testing.T) {
+	service := NewEngineService(EngineServiceConfig{
+		Registry: FactorRegistry{
+			"f_amount": {
+				FactorCode: "f_amount",
+				OutputSchema: Schema{
+					"value": {Type: ValueTypeLong, Required: true},
+				},
+			},
+		},
+	})
+
+	_, err := service.PublishRuleSet(RuleSetDefinition{
+		RuleSetCode: "bad_rules",
+		Version:     1,
+		Rules: []RuleDefinition{
+			{RuleCode: "bad", Expression: "f_amount && 100"},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected publish error")
+	}
+	if v, ok := err.(ValidationError); !ok || v.Code != ErrTypeMismatch {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestEngineServiceLatestVersionAndMissingRule(t *testing.T) {
+	service := NewEngineService(EngineServiceConfig{
+		Registry: FactorRegistry{
+			"f_amount": {
+				FactorCode: "f_amount",
+				OutputSchema: Schema{
+					"value": {Type: ValueTypeLong, Required: true},
+				},
+			},
+		},
+	})
+
+	for _, version := range []int{1, 2} {
+		_, err := service.PublishRuleSet(RuleSetDefinition{
+			RuleSetCode: "pricing",
+			Version:     version,
+			Rules: []RuleDefinition{
+				{RuleCode: "r_amount", Expression: "f_amount > 100"},
+			},
+		})
+		if err != nil {
+			t.Fatalf("PublishRuleSet version %d returned error: %v", version, err)
+		}
+	}
+
+	versions := service.ListRuleSetVersions("pricing")
+	if len(versions) != 2 || versions[0] != 1 || versions[1] != 2 {
+		t.Fatalf("unexpected versions: %#v", versions)
+	}
+
+	result, err := service.EvalLatestRule("pricing", "r_amount", EvalContext{
+		"f_amount": int64(50),
+	})
+	if err != nil {
+		t.Fatalf("EvalLatestRule returned error: %v", err)
+	}
+	if result != false {
+		t.Fatalf("unexpected latest eval result: %v", result)
+	}
+
+	_, err = service.EvalRule("pricing", 2, "missing", EvalContext{})
+	if err == nil {
+		t.Fatal("expected missing rule error")
+	}
+}
+
 func TestCompileFactorAccessor(t *testing.T) {
 	factor := &FactorDefinition{
 		FactorCode: "f_user_info",
