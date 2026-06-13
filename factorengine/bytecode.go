@@ -2,48 +2,60 @@ package factorengine
 
 import "fmt"
 
-type OpCode string
+type OpCode byte
 
 const (
-	OpPushConst   OpCode = "PUSH_CONST"
-	OpLoadFactor  OpCode = "LOAD_FACTOR"
-	OpMakeList    OpCode = "MAKE_LIST"
-	OpMakeMap     OpCode = "MAKE_MAP"
-	OpUnaryNot    OpCode = "UNARY_NOT"
-	OpUnaryNeg    OpCode = "UNARY_NEG"
-	OpBinaryLT    OpCode = "BINARY_LT"
-	OpBinaryLE    OpCode = "BINARY_LE"
-	OpBinaryGT    OpCode = "BINARY_GT"
-	OpBinaryGE    OpCode = "BINARY_GE"
-	OpBinaryEQ    OpCode = "BINARY_EQ"
-	OpBinaryNE    OpCode = "BINARY_NE"
-	OpBinaryAdd   OpCode = "BINARY_ADD"
-	OpBinarySub   OpCode = "BINARY_SUB"
-	OpBinaryMul   OpCode = "BINARY_MUL"
-	OpBinaryDiv   OpCode = "BINARY_DIV"
-	OpJumpIfFalse OpCode = "JUMP_IF_FALSE"
-	OpJumpIfTrue  OpCode = "JUMP_IF_TRUE"
-	OpJump        OpCode = "JUMP"
-	OpCallBuiltin OpCode = "CALL_BUILTIN"
+	OpPushConst OpCode = iota
+	OpLoadFactor
+	OpMakeList
+	OpMakeMap
+	OpUnaryNot
+	OpUnaryNeg
+	OpBinaryLT
+	OpBinaryLE
+	OpBinaryGT
+	OpBinaryGE
+	OpBinaryEQ
+	OpBinaryNE
+	OpBinaryAdd
+	OpBinarySub
+	OpBinaryMul
+	OpBinaryDiv
+	OpJumpIfFalse
+	OpJumpIfTrue
+	OpJump
+	OpCallBuiltin
 )
 
 type Instruction struct {
-	Op       OpCode
-	Arg      int
-	Value    any
-	Text     string
-	Accessor ValueAccessor
+	Op  OpCode
+	Arg int
+	Aux int
 }
 
 type BytecodeProgram struct {
 	Instructions []Instruction
+	Constants    []any
+	Accessors    []ValueAccessor
+	Builtins     []string
 	ResultType   ValueType
 }
 
-type BytecodeCompiler struct{}
+type BytecodeCompiler struct {
+	constIndex    map[string]int
+	accessorIndex map[string]int
+	builtinIndex  map[string]int
+	constants     []any
+	accessors     []ValueAccessor
+	builtins      []string
+}
 
 func NewBytecodeCompiler() *BytecodeCompiler {
-	return &BytecodeCompiler{}
+	return &BytecodeCompiler{
+		constIndex:    make(map[string]int),
+		accessorIndex: make(map[string]int),
+		builtinIndex:  make(map[string]int),
+	}
 }
 
 func (c *BytecodeCompiler) Compile(expr BoundExpr) (BytecodeProgram, error) {
@@ -53,6 +65,9 @@ func (c *BytecodeCompiler) Compile(expr BoundExpr) (BytecodeProgram, error) {
 	}
 	return BytecodeProgram{
 		Instructions: instructions,
+		Constants:    append([]any(nil), c.constants...),
+		Accessors:    append([]ValueAccessor(nil), c.accessors...),
+		Builtins:     append([]string(nil), c.builtins...),
 		ResultType:   expr.ResultType(),
 	}, nil
 }
@@ -60,9 +75,9 @@ func (c *BytecodeCompiler) Compile(expr BoundExpr) (BytecodeProgram, error) {
 func (c *BytecodeCompiler) emitExpr(expr BoundExpr, instructions *[]Instruction) error {
 	switch e := expr.(type) {
 	case BoundLiteralExpr:
-		*instructions = append(*instructions, Instruction{Op: OpPushConst, Value: e.Value})
+		*instructions = append(*instructions, Instruction{Op: OpPushConst, Arg: c.internConst(e.Value)})
 	case BoundFactorRefExpr:
-		*instructions = append(*instructions, Instruction{Op: OpLoadFactor, Accessor: e.Accessor})
+		*instructions = append(*instructions, Instruction{Op: OpLoadFactor, Arg: c.internAccessor(e.Accessor)})
 	case BoundListExpr:
 		for _, elem := range e.Elements {
 			if err := c.emitExpr(elem, instructions); err != nil {
@@ -72,7 +87,7 @@ func (c *BytecodeCompiler) emitExpr(expr BoundExpr, instructions *[]Instruction)
 		*instructions = append(*instructions, Instruction{Op: OpMakeList, Arg: len(e.Elements)})
 	case BoundMapExpr:
 		for _, entry := range e.Entries {
-			*instructions = append(*instructions, Instruction{Op: OpPushConst, Value: entry.Key})
+			*instructions = append(*instructions, Instruction{Op: OpPushConst, Arg: c.internConst(entry.Key)})
 			if err := c.emitExpr(entry.Value, instructions); err != nil {
 				return err
 			}
@@ -127,7 +142,7 @@ func (c *BytecodeCompiler) emitExpr(expr BoundExpr, instructions *[]Instruction)
 				return err
 			}
 		}
-		*instructions = append(*instructions, Instruction{Op: OpCallBuiltin, Text: e.Name, Arg: len(e.Args)})
+		*instructions = append(*instructions, Instruction{Op: OpCallBuiltin, Arg: c.internBuiltin(e.Name), Aux: len(e.Args)})
 	default:
 		return ValidationError{Code: ErrExpressionInvalid, Message: fmt.Sprintf("unsupported bound expression %T", expr)}
 	}
@@ -147,7 +162,7 @@ func (c *BytecodeCompiler) emitShortCircuitBinary(expr BoundBinaryExpr, instruct
 		jumpEndIdx := len(*instructions)
 		*instructions = append(*instructions, Instruction{Op: OpJump})
 		(*instructions)[jumpFalseIdx].Arg = len(*instructions)
-		*instructions = append(*instructions, Instruction{Op: OpPushConst, Value: false})
+		*instructions = append(*instructions, Instruction{Op: OpPushConst, Arg: c.internConst(false)})
 		(*instructions)[jumpEndIdx].Arg = len(*instructions)
 		return nil
 	}
@@ -160,9 +175,41 @@ func (c *BytecodeCompiler) emitShortCircuitBinary(expr BoundBinaryExpr, instruct
 	jumpEndIdx := len(*instructions)
 	*instructions = append(*instructions, Instruction{Op: OpJump})
 	(*instructions)[jumpTrueIdx].Arg = len(*instructions)
-	*instructions = append(*instructions, Instruction{Op: OpPushConst, Value: true})
+	*instructions = append(*instructions, Instruction{Op: OpPushConst, Arg: c.internConst(true)})
 	(*instructions)[jumpEndIdx].Arg = len(*instructions)
 	return nil
+}
+
+func (c *BytecodeCompiler) internConst(value any) int {
+	key := fmt.Sprintf("%T:%#v", value, value)
+	if idx, ok := c.constIndex[key]; ok {
+		return idx
+	}
+	idx := len(c.constants)
+	c.constants = append(c.constants, value)
+	c.constIndex[key] = idx
+	return idx
+}
+
+func (c *BytecodeCompiler) internAccessor(accessor ValueAccessor) int {
+	key := fmt.Sprintf("%#v", accessor)
+	if idx, ok := c.accessorIndex[key]; ok {
+		return idx
+	}
+	idx := len(c.accessors)
+	c.accessors = append(c.accessors, accessor)
+	c.accessorIndex[key] = idx
+	return idx
+}
+
+func (c *BytecodeCompiler) internBuiltin(name string) int {
+	if idx, ok := c.builtinIndex[name]; ok {
+		return idx
+	}
+	idx := len(c.builtins)
+	c.builtins = append(c.builtins, name)
+	c.builtinIndex[name] = idx
+	return idx
 }
 
 func binaryOpcode(op string) (OpCode, error) {
@@ -188,7 +235,7 @@ func binaryOpcode(op string) (OpCode, error) {
 	case "/":
 		return OpBinaryDiv, nil
 	default:
-		return "", ValidationError{Code: ErrUnsupportedOperator, Message: fmt.Sprintf("unsupported binary operator %q", op)}
+		return 0, ValidationError{Code: ErrUnsupportedOperator, Message: fmt.Sprintf("unsupported binary operator %q", op)}
 	}
 }
 
@@ -205,12 +252,15 @@ func (vm *BytecodeVM) Eval(program BytecodeProgram, ctx EvalContext) (any, error
 		inst := program.Instructions[ip]
 		switch inst.Op {
 		case OpPushConst:
-			stack = append(stack, inst.Value)
-		case OpLoadFactor:
-			if inst.Accessor == nil {
-				return nil, ValidationError{Code: ErrExpressionInvalid, Message: "missing factor accessor"}
+			if inst.Arg < 0 || inst.Arg >= len(program.Constants) {
+				return nil, ValidationError{Code: ErrExpressionInvalid, Message: "invalid constant index"}
 			}
-			value, ok := inst.Accessor.Get(ctx)
+			stack = append(stack, program.Constants[inst.Arg])
+		case OpLoadFactor:
+			if inst.Arg < 0 || inst.Arg >= len(program.Accessors) {
+				return nil, ValidationError{Code: ErrExpressionInvalid, Message: "invalid accessor index"}
+			}
+			value, ok := program.Accessors[inst.Arg].Get(ctx)
 			if !ok {
 				stack = append(stack, nil)
 			} else {
@@ -292,13 +342,16 @@ func (vm *BytecodeVM) Eval(program BytecodeProgram, ctx EvalContext) (any, error
 			ip = inst.Arg
 			continue
 		case OpCallBuiltin:
-			if len(stack) < inst.Arg {
+			if inst.Arg < 0 || inst.Arg >= len(program.Builtins) {
+				return nil, ValidationError{Code: ErrExpressionInvalid, Message: "invalid builtin index"}
+			}
+			if len(stack) < inst.Aux {
 				return nil, ValidationError{Code: ErrExpressionInvalid, Message: "stack underflow in CALL_BUILTIN"}
 			}
-			start := len(stack) - inst.Arg
+			start := len(stack) - inst.Aux
 			args := append([]any(nil), stack[start:]...)
 			stack = stack[:start]
-			result, err := evalBuiltinValues(inst.Text, args)
+			result, err := evalBuiltinValues(program.Builtins[inst.Arg], args)
 			if err != nil {
 				return nil, err
 			}

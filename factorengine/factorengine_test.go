@@ -1034,6 +1034,59 @@ func TestBytecodeVMEvalMatchesCompiledEval(t *testing.T) {
 	}
 }
 
+func TestBytecodeUsesPools(t *testing.T) {
+	registry := FactorRegistry{
+		"f_amount": {
+			FactorCode: "f_amount",
+			OutputSchema: Schema{
+				"value": {Type: ValueTypeLong, Required: true},
+			},
+		},
+	}
+
+	compiled, err := NewRuleCompiler().Compile("contains([1, 2, 1], f_amount) ? \"hit\" : \"miss\"", registry)
+	if err != nil {
+		t.Fatalf("Compile returned error: %v", err)
+	}
+
+	bytecode := compiled.Bytecode()
+	if len(bytecode.Constants) == 0 {
+		t.Fatal("expected constant pool to be populated")
+	}
+	if len(bytecode.Accessors) == 0 {
+		t.Fatal("expected accessor pool to be populated")
+	}
+	if len(bytecode.Builtins) == 0 {
+		t.Fatal("expected builtin pool to be populated")
+	}
+
+	foundConst := false
+	foundLoad := false
+	foundBuiltin := false
+	for _, inst := range bytecode.Instructions {
+		switch inst.Op {
+		case OpPushConst:
+			foundConst = true
+			if inst.Arg < 0 || inst.Arg >= len(bytecode.Constants) {
+				t.Fatalf("invalid constant pool index: %d", inst.Arg)
+			}
+		case OpLoadFactor:
+			foundLoad = true
+			if inst.Arg < 0 || inst.Arg >= len(bytecode.Accessors) {
+				t.Fatalf("invalid accessor pool index: %d", inst.Arg)
+			}
+		case OpCallBuiltin:
+			foundBuiltin = true
+			if inst.Arg < 0 || inst.Arg >= len(bytecode.Builtins) {
+				t.Fatalf("invalid builtin pool index: %d", inst.Arg)
+			}
+		}
+	}
+	if !foundConst || !foundLoad || !foundBuiltin {
+		t.Fatalf("expected pooled instructions, got const=%v load=%v builtin=%v", foundConst, foundLoad, foundBuiltin)
+	}
+}
+
 func TestBytecodeVMConditionalAndGet(t *testing.T) {
 	registry := FactorRegistry{
 		"f_device_info": {
