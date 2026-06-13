@@ -529,6 +529,77 @@ func TestCachedRuleCompilerHitsCache(t *testing.T) {
 	}
 }
 
+func TestObservedRuleCompilerRecordsCompileEvalAndCache(t *testing.T) {
+	registry := FactorRegistry{
+		"f_amount": {
+			FactorCode: "f_amount",
+			OutputSchema: Schema{
+				"value": {Type: ValueTypeLong, Required: true},
+			},
+		},
+	}
+	observer := NewInMemoryRuleObserver()
+	cache := NewInMemoryProgramCache()
+	compiler := NewObservedRuleCompiler(
+		NewObservedCachedRuleCompiler(NewRuleCompiler(), cache, observer),
+		observer,
+	)
+
+	first, err := compiler.Compile("f_amount > 100", registry)
+	if err != nil {
+		t.Fatalf("first Compile returned error: %v", err)
+	}
+	second, err := compiler.Compile("f_amount > 100", registry)
+	if err != nil {
+		t.Fatalf("second Compile returned error: %v", err)
+	}
+	if first.Fingerprint() != second.Fingerprint() {
+		t.Fatalf("expected matching fingerprint, got %q and %q", first.Fingerprint(), second.Fingerprint())
+	}
+	result, err := second.Eval(EvalContext{
+		"f_amount": int64(200),
+	})
+	if err != nil {
+		t.Fatalf("Eval returned error: %v", err)
+	}
+	if result != true {
+		t.Fatalf("unexpected eval result: %v", result)
+	}
+
+	stats := observer.Stats()
+	if stats.CompileCount != 2 || stats.CompileErrors != 0 {
+		t.Fatalf("unexpected compile stats: %+v", stats)
+	}
+	if stats.EvalCount != 1 || stats.EvalErrors != 0 {
+		t.Fatalf("unexpected eval stats: %+v", stats)
+	}
+	if stats.CacheRequests != 2 || stats.CacheHits != 1 || stats.CacheMisses != 1 {
+		t.Fatalf("unexpected cache observer stats: %+v", stats)
+	}
+}
+
+func TestObservedRuleCompilerRecordsCompileErrors(t *testing.T) {
+	observer := NewInMemoryRuleObserver()
+	compiler := NewObservedRuleCompiler(NewRuleCompiler(), observer)
+
+	_, err := compiler.Compile("f_amount && 100", FactorRegistry{
+		"f_amount": {
+			FactorCode: "f_amount",
+			OutputSchema: Schema{
+				"value": {Type: ValueTypeLong, Required: true},
+			},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected compile error")
+	}
+
+	stats := observer.Stats()
+	if stats.CompileCount != 1 || stats.CompileErrors != 1 {
+		t.Fatalf("unexpected observer stats: %+v", stats)
+	}
+}
+
 func TestCompileFactorAccessor(t *testing.T) {
 	factor := &FactorDefinition{
 		FactorCode: "f_user_info",

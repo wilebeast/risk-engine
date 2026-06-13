@@ -77,20 +77,29 @@ func (c *InMemoryProgramCache) Stats() ProgramCacheStats {
 }
 
 type CachedRuleCompiler struct {
-	inner RuleCompiler
-	cache ProgramCache
+	inner    RuleCompiler
+	cache    ProgramCache
+	observer RuleObserver
 }
 
 func NewCachedRuleCompiler(inner RuleCompiler, cache ProgramCache) RuleCompiler {
+	return NewObservedCachedRuleCompiler(inner, cache, nil)
+}
+
+func NewObservedCachedRuleCompiler(inner RuleCompiler, cache ProgramCache, observer RuleObserver) RuleCompiler {
 	if inner == nil {
 		inner = NewRuleCompiler()
 	}
 	if cache == nil {
 		cache = NewInMemoryProgramCache()
 	}
+	if observer == nil {
+		observer = NoopRuleObserver{}
+	}
 	return CachedRuleCompiler{
-		inner: inner,
-		cache: cache,
+		inner:    inner,
+		cache:    cache,
+		observer: observer,
 	}
 }
 
@@ -104,8 +113,19 @@ func (c CachedRuleCompiler) Compile(expr string, registry FactorRegistry) (Compi
 		return nil, err
 	}
 	if compiled, ok := c.cache.Get(key); ok {
+		c.observer.ObserveCache(CacheObservation{
+			Expr:        expr,
+			Key:         key,
+			Fingerprint: compiled.Fingerprint(),
+			Hit:         true,
+		})
 		return compiled, nil
 	}
+	c.observer.ObserveCache(CacheObservation{
+		Expr: expr,
+		Key:  key,
+		Hit:  false,
+	})
 	compiled, err := c.inner.Compile(expr, registry)
 	if err != nil {
 		return nil, err
