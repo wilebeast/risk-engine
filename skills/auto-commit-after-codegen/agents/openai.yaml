@@ -1,0 +1,7 @@
+interface:
+  display_name: "Auto Commit After Codegen"
+  short_description: "Commit implementation changes locally by default after validation."
+  default_prompt: "Use $auto-commit-after-codegen to implement the requested code changes, run the smallest relevant validation, and finish with a focused local commit unless I explicitly say not to commit."
+
+policy:
+  allow_implicit_invocation: true
